@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gorilla/websocket"
@@ -143,7 +144,7 @@ func testWSReverseProxy(t *testing.T, config *testConfig) {
 	backend := newServer(http.HandlerFunc(f))
 	p, err := newWSReverseProxy(&wsProxyConfig{
 		TLSConfig: backend.TLS,
-		Backend:   toWSURL(backend.URL),
+		Backend:   backend.URL,
 		Logger:    log.New(ioutil.Discard, "", 0),
 	})
 	if err != nil {
@@ -153,7 +154,7 @@ func testWSReverseProxy(t *testing.T, config *testConfig) {
 	proxy := newServer(p)
 
 	dialer := &websocket.Dialer{TLSClientConfig: proxy.TLS}
-	targetURL := toWSURL(proxy.URL)
+	targetURL := "ws" + strings.TrimPrefix(proxy.URL, "http")
 	h := http.Header{}
 	if config.modifyRequest != nil {
 		targetURL, h = config.modifyRequest(targetURL, h)
@@ -173,24 +174,6 @@ func testWSReverseProxy(t *testing.T, config *testConfig) {
 	}
 	if !bytes.Equal(b, []byte("goodbye")) {
 		t.Errorf("unexpected data from websocket: %s", b)
-	}
-}
-
-func TestToWSURL(t *testing.T) {
-	tests := []struct {
-		url  string
-		want string
-	}{
-		{"https://foo.com", "wss://foo.com"},
-		{"http://foo.com", "ws://foo.com"},
-		{"wss://foo.com", "wss://foo.com"},
-	}
-
-	for _, test := range tests {
-		got := toWSURL(test.url)
-		if got != test.want {
-			t.Errorf("toWSURL(%q), wanted=%s, got=%s", test.url, test.want, got)
-		}
 	}
 }
 
@@ -218,7 +201,7 @@ func TestIsWSRequest(t *testing.T) {
 				r.Header.Set("Upgrade", "h2c")
 				return r
 			}(),
-			isWS: false,
+			isWS: true,
 		},
 		{
 			name: "with_comma",

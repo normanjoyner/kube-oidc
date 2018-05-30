@@ -3,14 +3,14 @@ package authproxy
 import (
 	"crypto/tls"
 	"io"
-	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 )
 
@@ -22,8 +22,7 @@ import (
 type wsReverseProxy struct {
 	backend *url.URL
 
-	upgrader *websocket.Upgrader
-	dialer   *websocket.Dialer
+	dial func(network, addr string) (net.Conn, error)
 
 	logger *log.Logger
 }
@@ -46,20 +45,48 @@ func newWSReverseProxy(c *wsProxyConfig) (*wsReverseProxy, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "parsing backend URL")
 	}
-	if u.Scheme != "ws" && u.Scheme != "wss" {
-		return nil, errors.Errorf("backend URL requires scheme ws:// or wss://, got %s", u.Scheme)
-	}
-	return &wsReverseProxy{
-		upgrader: &websocket.Upgrader{
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-		},
+
+	host, port, splitErr := net.SplitHostPort(u.Host)
+
+	p := &wsReverseProxy{
 		backend: u,
-		dialer: &websocket.Dialer{
-			TLSClientConfig: c.TLSConfig,
-		},
-		logger: c.Logger,
-	}, nil
+		logger:  c.Logger,
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		DualStack: true,
+	}
+
+	switch u.Scheme {
+	case "http":
+		if splitErr != nil {
+			port = "80"
+			host = u.Host
+		}
+		p.dial = dialer.Dial
+	case "https":
+		if splitErr != nil {
+			port = "443"
+			host = u.Host
+		}
+		tlsConfig := c.TLSConfig
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{}
+		}
+		if tlsConfig.ServerName == "" {
+			tlsConfig.ServerName = host
+		}
+		p.dial = func(network, addr string) (net.Conn, error) {
+			return tls.DialWithDialer(dialer, network, addr, tlsConfig)
+		}
+	default:
+		return nil, errors.Errorf("backend URL requires scheme http:// or https://, got %s", u.Scheme)
+	}
+	p.backend.Host = net.JoinHostPort(host, port)
+
+	return p, nil
 }
 
 func (p *wsReverseProxy) logf(format string, v ...interface{}) {
@@ -70,98 +97,64 @@ func (p *wsReverseProxy) logf(format string, v ...interface{}) {
 	log.Printf(format, v...)
 }
 
-// Headers which the websocket dialer adds itself and will complain about
-// existing beforehand.
-//
-// https://github.com/gorilla/websocket/blob/v1.2.0/client.go#L233
-var headerBlacklist = map[string]bool{
-	"Upgrade":                  true,
-	"Connection":               true,
-	"Sec-Websocket-Key":        true,
-	"Sec-Websocket-Version":    true,
-	"Sec-Websocket-Extensions": true,
-}
-
 func (p *wsReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !isWSRequest(r) {
+	if r.Header.Get("Upgrade") == "" {
 		p.logf("wsutil: attempted to proxy a non-websocket request")
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 
-	headerCp := http.Header{}
-	for k, vv := range r.Header {
-		if !headerBlacklist[k] {
-			headerCp[k] = vv
-		}
+	r.URL.Host = p.backend.Host
+	r.URL.Scheme = p.backend.Scheme
+	r.URL.Path = path.Join(p.backend.Path, r.URL.Path)
+
+	connBackend, err := p.dial("tcp", p.backend.Host)
+	if err != nil {
+		p.logf("dial backend: %v", err)
+		http.Error(w, "Bad gateway", http.StatusBadGateway)
+		return
+	}
+	defer connBackend.Close()
+
+	h, ok := w.(http.Hijacker)
+	if !ok {
+		p.logf("response writer isn't a hijacker for websocket connections")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	connFrontend, brw, err := h.Hijack()
+	if err != nil {
+		p.logf("response writer can't be hijacked for websocket connections: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer connFrontend.Close()
+
+	if brw.Reader.Buffered() > 0 {
+		p.logf("client sent data before handshake is complete")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
 	}
 
-	var backend url.URL
-	backend = *p.backend
-	backend.Path = path.Join(backend.Path, r.URL.Path)
-	backend.RawQuery = r.URL.RawQuery
-
-	conn1, resp, err := p.dialer.Dial(backend.String(), headerCp)
-	if err != nil {
-		if err == websocket.ErrBadHandshake {
-			// ErrBadHandshake indicates that the response holds an error
-			// from the backend service.
-			//
-			// TODO: Include headers?
-			body, _ := ioutil.ReadAll(resp.Body)
-			if len(body) > 0 {
-				err = errors.Errorf("%v %s %s", err, resp.Status, body)
-			} else {
-				err = errors.Errorf("%v %s", err, resp.Status)
-			}
-			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
-		}
-		p.logf("wsutil: dial backend: %v", err)
+	if err := r.WriteProxy(connBackend); err != nil {
+		p.logf("write request to backend: %v", err)
 		http.Error(w, "Bad gateway", http.StatusBadGateway)
 		return
 	}
 
-	conn2, err := p.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		conn1.Close()
-		p.logf("wsutil: failed to upgrade request: %v", err)
-		return
+	done := make(chan error, 2)
+	cp := func(dest, src net.Conn) {
+		_, err := io.Copy(dest, src)
+		done <- err
 	}
 
-	done := make(chan struct{}, 2)
-	cp := func(dest, src *websocket.Conn) {
-		defer func() { done <- struct{}{} }()
-		for {
-			typ, p, err := src.ReadMessage()
-			if err != nil {
-				return
-			}
-			if err := dest.WriteMessage(typ, p); err != nil {
-				return
-			}
-		}
-	}
-
-	go cp(conn1, conn2)
-	go cp(conn2, conn1)
+	go cp(connFrontend, connBackend)
+	go cp(connBackend, connFrontend)
 	<-done
 	// Close both connections
-	conn1.Close()
-	conn2.Close()
+	connBackend.Close()
+	connFrontend.Close()
 	<-done
-}
-
-// toWSURL replaces the scheme of a HTTP or HTTPS to its equivalent
-// WS or WSS protocol.
-//
-//		print(wsutil.toWSURL("https://example.com")) // "wss://example.com"
-//
-func toWSURL(httpURL string) string {
-	if !strings.HasPrefix(httpURL, "http") {
-		return httpURL
-	}
-	return "ws" + httpURL[len("http"):]
 }
 
 // isWSRequest determines if an HTTP request is attempting to upgrade to
@@ -179,7 +172,7 @@ func isWSRequest(r *http.Request) bool {
 	if !contains("Connection", "upgrade") {
 		return false
 	}
-	if !contains("Upgrade", "websocket") {
+	if r.Header.Get("Upgrade") == "" {
 		return false
 	}
 	return true

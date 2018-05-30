@@ -56,7 +56,7 @@ func New(c *Config) (http.Handler, error) {
 	httpProxy.ErrorLog = c.Logger
 
 	wsProxy, err := newWSReverseProxy(&wsProxyConfig{
-		Backend:   toWSURL(c.Backend),
+		Backend:   c.Backend,
 		TLSConfig: c.BackendTLSConfig,
 		Logger:    c.Logger,
 	})
